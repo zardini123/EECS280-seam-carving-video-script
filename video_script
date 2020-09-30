@@ -1,0 +1,146 @@
+#!/bin/bash
+
+cleanup() {
+  ##################
+  # CLEANUP
+
+  # ENABLE THIS EXIT IF YOU WANT TO DISABLE CLEANUP OF TEMPORARY FILES
+  # exit 0
+
+  echo "Cleanup..."
+
+  rm -r "__video_temp_frames"
+  echo "rm __video_temp_frames/"
+
+  # Cleanup from shrinking of input image
+  # NOTE: Space around argument is required!
+  if [ "$INPUT_FILE_BIG" = true ]; then
+    rm "${SCALED_INPUT_FILE_BASE}"
+    echo "rm ${SCALED_INPUT_FILE_BASE}"
+  fi
+
+  exit 0
+}
+
+trap "cleanup" INT
+
+RESIZE_EXE_PATH="$1"
+INPUT_FILE="$2"
+OUTPUT_FILE="$3"
+START_PERCENT="$4"
+END_PERCENT="$5"
+
+ORIGINAL_INPUT_FILE_NAME=$(basename -- "$INPUT_FILE")
+INPUT_FILE_EXTENSION="${ORIGINAL_INPUT_FILE_NAME##*.}"
+
+# Acquire resoltion from original input
+INPUT_RESOLUTION=$(ffprobe -v error -show_entries stream=width,height -of csv=p=0:s=x "${INPUT_FILE}")
+
+X_RESOLUTION="$(cut -d 'x' -f1 <<<"$INPUT_RESOLUTION")"
+Y_RESOLUTION="$(cut -d 'x' -f2 <<<"$INPUT_RESOLUTION")"
+
+##################
+# INPUT SCALING
+
+INPUT_FILE_BIG=false
+# if x_res <= 500 or y_res <= 500
+if (("${X_RESOLUTION}" > 500)) || (("${Y_RESOLUTION}" > 500)); then
+  INPUT_FILE_BIG=true
+
+  echo "Input resoltion too big for 500x500 maximum"
+  echo "Shrinking input file"
+
+  ASPECT_RATIO=$(($X_RESOLUTION / $Y_RESOLUTION))
+
+  # Setup the resolution so any resolution is not greater than 500x500
+  # (and ensure resolution is divisible by two using ":-2")
+  FFMPEG_INITAL_SCALE_ARGUMENT=""
+  if (("${X_RESOLUTION}" >= "${Y_RESOLUTION}")); then
+    FFMPEG_INITAL_SCALE_ARGUMENT="500:-2"
+  else
+    FFMPEG_INITAL_SCALE_ARGUMENT="-2:500"
+  fi
+
+  SCALED_INPUT_FILE_BASE="__video_temp_scaled.${INPUT_FILE_EXTENSION}"
+
+  # Shrink the input
+  ffmpeg -hide_banner -loglevel panic -i "${INPUT_FILE}" -vf scale="${FFMPEG_INITAL_SCALE_ARGUMENT}" "${SCALED_INPUT_FILE_BASE}"
+
+  # Query the size of the input to see what ffmpeg chose as the dimensions
+  SCALED_INPUT_RESOLUTION=$(ffprobe -v error -show_entries stream=width,height -of csv=p=0:s=x "${SCALED_INPUT_FILE_BASE}")
+
+  # Overwrite the input image directory and resolution for the following code
+  INPUT_FILE="${SCALED_INPUT_FILE_BASE}"
+  X_RESOLUTION="$(cut -d 'x' -f1 <<<"$SCALED_INPUT_RESOLUTION")"
+  Y_RESOLUTION="$(cut -d 'x' -f2 <<<"$SCALED_INPUT_RESOLUTION")"
+fi
+
+##################################
+# FRAME SPLITTING AND CONVERSION
+
+echo "X resolution: ${X_RESOLUTION}, Y resolution: ${Y_RESOLUTION}"
+
+INPUT_FRAME_RATE=$(ffprobe -v error -select_streams v -of default=noprint_wrappers=1:nokey=1 -show_entries stream=r_frame_rate "${INPUT_FILE}")
+echo "Frame rate: ${INPUT_FRAME_RATE}"
+
+mkdir "__video_temp_frames"
+ffmpeg -hide_banner -loglevel panic -i "${INPUT_FILE}" __video_temp_frames/base_%04d.png
+
+# Get number of frames by counting number of files in __video_temp_frames
+# Quick and dirty way to get number of frames in input
+INPUT_NUMBER_OF_FRAMES=$(ls -l __video_temp_frames/ | egrep -c '^-')
+echo "Number of frames: ${INPUT_NUMBER_OF_FRAMES}"
+
+# Go through each extracted frame
+current_frame=1
+for FRAME_FILENAME in __video_temp_frames/base_*.png; do
+  echo "Frame ${current_frame}/${INPUT_NUMBER_OF_FRAMES}, Converting ${FRAME_FILENAME}..."
+
+  # Convert the frame to ppm using imagemagic
+  INPUT_PPM="${FRAME_FILENAME%.*}.ppm"
+  convert "${FRAME_FILENAME}" -compress none "${INPUT_PPM}"
+
+  if [ "${INPUT_NUMBER_OF_FRAMES}" -ne "1" ]; then
+    # Linearly interpolate resolution over time
+    # bc used for floating-point arithmetic, printf for floating-point to integer conversion
+    SCALED_X_RESOLUTION=$(printf '%.0f' "$(echo "scale=10; ((${START_PERCENT}*${X_RESOLUTION})+((${current_frame} - 1) / (${INPUT_NUMBER_OF_FRAMES} - 1))*(${X_RESOLUTION} * (${END_PERCENT} - ${START_PERCENT})))/100" | bc -l)")
+    SCALED_X_RESOLUTION=${SCALED_X_RESOLUTION%.*}
+    SCALED_Y_RESOLUTION=$(printf '%.0f' "$(echo "scale=10; ((${START_PERCENT}*${Y_RESOLUTION})+((${current_frame} - 1) / (${INPUT_NUMBER_OF_FRAMES} - 1))*(${Y_RESOLUTION} * (${END_PERCENT} - ${START_PERCENT})))/100" | bc -l)")
+    SCALED_Y_RESOLUTION=${SCALED_Y_RESOLUTION%.*}
+  else
+    SCALED_X_RESOLUTION=$(printf '%.0f' "$(echo "scale=10; (${START_PERCENT}*${X_RESOLUTION})/100" | bc -l)")
+    SCALED_X_RESOLUTION=${SCALED_X_RESOLUTION%.*}
+    SCALED_Y_RESOLUTION=$(printf '%.0f' "$(echo "scale=10; (${START_PERCENT}*${Y_RESOLUTION})/100" | bc -l)")
+    SCALED_Y_RESOLUTION=${SCALED_Y_RESOLUTION%.*}
+  fi
+
+  echo -e "\tScaled resolution: ${SCALED_X_RESOLUTION}x${SCALED_Y_RESOLUTION}"
+
+  # Run resize.exe on the converted ppm frame
+  OUTPUT_PPM="${FRAME_FILENAME%.*}_resized.ppm"
+  eval "${RESIZE_EXE_PATH} ${INPUT_PPM} ${OUTPUT_PPM} ${SCALED_X_RESOLUTION} ${SCALED_Y_RESOLUTION}"
+
+  # Scale back up to original input resolution
+  FINAL_IMAGE="${FRAME_FILENAME%.*}_final.png"
+  ffmpeg -hide_banner -loglevel panic -i "${OUTPUT_PPM}" -vf scale="${X_RESOLUTION}:${Y_RESOLUTION}" "${FINAL_IMAGE}"
+
+  # Cleanup for this frame
+  rm "${INPUT_PPM}"
+  rm "${OUTPUT_PPM}"
+  rm "${FRAME_FILENAME}"
+
+  current_frame=$((current_frame + 1))
+done
+
+if [ "${INPUT_NUMBER_OF_FRAMES}" -eq "1" ]; then
+  # Create final image
+  ffmpeg -y -hide_banner -i __video_temp_frames/base_%04d_final.png "${OUTPUT_FILE%.*}.png"
+else
+
+  echo "Encoding video from sequence..."
+
+  # Create final video
+  ffmpeg -y -hide_banner -i __video_temp_frames/base_%04d_final.png -r "${INPUT_FRAME_RATE}" -vcodec libx264 -pix_fmt yuv420p "${OUTPUT_FILE%.*}.mp4"
+fi
+
+cleanup
