@@ -1,0 +1,1 @@
+# EECS280-seam-carving-video-script
